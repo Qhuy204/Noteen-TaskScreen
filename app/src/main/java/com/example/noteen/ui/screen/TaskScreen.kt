@@ -1,7 +1,14 @@
 package com.example.noteen.ui.screen
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
 import androidx.compose.animation.*
 import androidx.compose.animation.core.LinearOutSlowInEasing
@@ -44,7 +51,6 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
@@ -54,12 +60,15 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.commandiron.wheel_picker_compose.WheelDateTimePicker
 import com.commandiron.wheel_picker_compose.core.TimeFormat
 import com.commandiron.wheel_picker_compose.core.WheelPickerDefaults
 import com.example.noteen.R
+import com.example.noteen.utils.AlarmScheduler
+import com.example.noteen.utils.AlarmSchedulerImpl
 import com.example.noteen.viewmodel.DueDateStatus
 import com.example.noteen.viewmodel.SubTask
 import com.example.noteen.viewmodel.TaskGroup
@@ -68,10 +77,10 @@ import org.burnoutcrew.reorderable.ReorderableItem
 import org.burnoutcrew.reorderable.detectReorderAfterLongPress
 import org.burnoutcrew.reorderable.rememberReorderableLazyListState
 import org.burnoutcrew.reorderable.reorderable
-import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.*
+import android.app.AlarmManager
 
 // --- Định nghĩa màu sắc và hằng số ---
 private val brandBlue = Color(0xFF1966FF)
@@ -106,16 +115,13 @@ fun TaskScreen(
     var taskToEdit by remember { mutableStateOf<TaskGroup?>(null) }
     val haptics = LocalHapticFeedback.current
 
+    val context = LocalContext.current
+    val alarmScheduler: AlarmScheduler = remember { AlarmSchedulerImpl(context) }
+
     // Cấu hình state cho việc sắp xếp lại
     val reorderState = rememberReorderableLazyListState(
-        // onMove chỉ cập nhật state trong bộ nhớ, không ghi vào DB
-        onMove = { from, to ->
-            viewModel.moveTask(from.index, to.index)
-        },
-        // onDragEnd được gọi khi thả tay, lúc này mới lưu vào DB
-        onDragEnd = { _, _ ->
-            viewModel.saveTaskOrder()
-        }
+        onMove = { from, to -> viewModel.moveTask(from.index, to.index) },
+        onDragEnd = { _, _ -> viewModel.saveTaskOrder() }
     )
 
     with(sharedTransitionScope) {
@@ -125,12 +131,7 @@ fun TaskScreen(
                 .sharedElement(
                     state = rememberSharedContentState("task-board"),
                     animatedVisibilityScope = animatedVisibilityScope,
-                    boundsTransform = { _, _ ->
-                        tween(
-                            durationMillis = 1000,
-                            easing = LinearOutSlowInEasing
-                        )
-                    },
+                    boundsTransform = { _, _ -> tween(durationMillis = 1000, easing = LinearOutSlowInEasing) },
                     placeHolderSize = SharedTransitionScope.PlaceHolderSize.contentSize,
                     zIndexInOverlay = 1f
                 )
@@ -164,21 +165,17 @@ fun TaskScreen(
                 ) {
                     itemsIndexed(todoTasks, key = { _, item -> item.id }) { index, task ->
                         ReorderableItem(reorderableState = reorderState, key = task.id) { isDragging ->
-                            // Kích hoạt rung khi bắt đầu kéo
                             LaunchedEffect(isDragging) {
                                 if (isDragging) {
                                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                 }
                             }
-                            // Animation cho hiệu ứng nổi lên (scale và shadow)
                             val scale by animateFloatAsState(if (isDragging) 1.05f else 1f, label = "scaleAnim")
                             val elevation by animateDpAsState(if (isDragging) 8.dp else 0.dp, label = "elevationAnim")
 
                             TaskGroupCard(
                                 modifier = Modifier
-                                    .animateItemPlacement(
-                                        tween(durationMillis = 300, easing = LinearOutSlowInEasing)
-                                    )
+                                    .animateItemPlacement(tween(durationMillis = 300, easing = LinearOutSlowInEasing))
                                     .detectReorderAfterLongPress(reorderState)
                                     .graphicsLayer {
                                         scaleX = scale
@@ -188,7 +185,14 @@ fun TaskScreen(
                                 taskGroup = task,
                                 isEditMode = isEditMode,
                                 isSelected = task.id in selectedTaskIds,
-                                onMasterCheckChange = { isChecked -> viewModel.toggleMasterCheckbox(task.id, isChecked) },
+                                onMasterCheckChange = { isChecked ->
+                                    viewModel.toggleMasterCheckbox(task.id, isChecked)
+                                    if (isChecked) {
+                                        alarmScheduler.cancel(task)
+                                    } else {
+                                        alarmScheduler.schedule(task)
+                                    }
+                                },
                                 onCardClick = {
                                     if (isEditMode) {
                                         viewModel.toggleSelection(task.id)
@@ -213,9 +217,7 @@ fun TaskScreen(
                         }
                         itemsIndexed(completedTasks, key = { _, item -> item.id }) { _, task ->
                             TaskGroupCard(
-                                modifier = Modifier.animateItemPlacement(
-                                    tween(durationMillis = 300, easing = LinearOutSlowInEasing)
-                                ),
+                                modifier = Modifier.animateItemPlacement(tween(durationMillis = 300, easing = LinearOutSlowInEasing)),
                                 taskGroup = task,
                                 isEditMode = isEditMode,
                                 isSelected = task.id in selectedTaskIds,
@@ -237,14 +239,13 @@ fun TaskScreen(
                 modifier = Modifier.align(Alignment.BottomCenter),
                 isVisible = isEditMode,
                 isDeleteEnabled = selectedTaskIds.isNotEmpty(),
-                onDelete = { showDeleteConfirmDialog = true } // Mở dialog xác nhận
+                onDelete = { showDeleteConfirmDialog = true }
             )
 
             BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                 val fabSize = 56.dp
                 val paddingEnd = 24.dp
                 val paddingBottom = 24.dp
-
                 val xOffset = maxWidth - fabSize - paddingEnd
                 val yOffset = maxHeight - fabSize - paddingBottom
 
@@ -254,13 +255,12 @@ fun TaskScreen(
                         .size(fabSize),
                     isVisible = !isEditMode,
                     onClick = {
-                        taskToEdit = null // Mở dialog để thêm task mới
+                        taskToEdit = null
                         showTaskDetailsDialog = true
                     }
                 )
             }
 
-            // Lớp phủ mờ phía sau dialog
             AnimatedVisibility(
                 visible = showTaskDetailsDialog || showDeleteConfirmDialog,
                 enter = fadeIn(animationSpec = tween(400)),
@@ -270,11 +270,10 @@ fun TaskScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(Color.Black.copy(alpha = 0.4f))
-                        .clickable { showTaskDetailsDialog = false }
+                        .clickable(enabled = false, onClick = {})
                 )
             }
 
-            // Dialog chi tiết task
             AnimatedVisibility(
                 visible = showTaskDetailsDialog,
                 enter = slideInVertically(animationSpec = tween(400, easing = LinearOutSlowInEasing)) { it },
@@ -285,23 +284,27 @@ fun TaskScreen(
                     onDismiss = { showTaskDetailsDialog = false },
                     onSaveTask = { taskToSave ->
                         viewModel.upsertTask(taskToSave)
+                        if (taskToSave.dueDate != null && !taskToSave.isCompleted) {
+                            alarmScheduler.schedule(taskToSave)
+                        } else {
+                            taskToEdit?.let { alarmScheduler.cancel(it) }
+                        }
                         showTaskDetailsDialog = false
                     },
                     tasksCount = tasks.size
                 )
             }
 
-            // Dialog xác nhận xóa
             if (showDeleteConfirmDialog) {
                 DeleteConfirmationDialog(
                     count = selectedTaskIds.size,
                     onConfirm = {
+                        val tasksToDelete = tasks.filter { it.id in selectedTaskIds }
+                        tasksToDelete.forEach { alarmScheduler.cancel(it) }
                         viewModel.deleteSelected()
                         showDeleteConfirmDialog = false
                     },
-                    onDismiss = {
-                        showDeleteConfirmDialog = false
-                    }
+                    onDismiss = { showDeleteConfirmDialog = false }
                 )
             }
         }
@@ -347,7 +350,6 @@ private fun TaskScreenHeader() {
             color = textPrimary
         )
         Spacer(Modifier.weight(1f))
-        // Nút để vào chế độ chỉnh sửa (thay cho long-press)
         val viewModel: TasksViewModel = viewModel()
         CustomIconButton(
             onClick = {
@@ -415,7 +417,6 @@ private fun TaskGroupCard(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (isEditMode) {
-                // Hiển thị icon checkbox khi ở chế độ chỉnh sửa
                 CustomCheckbox(
                     checked = isSelected,
                     onCheckedChange = { onCardClick() },
@@ -424,7 +425,6 @@ private fun TaskGroupCard(
                     modifier = Modifier.padding(8.dp)
                 )
             } else {
-                // Nút mở rộng/thu gọn chuyên dụng
                 if (totalCount > 0) {
                     CustomIconButton(onClick = onExpandToggle) {
                         Icon(
@@ -435,7 +435,7 @@ private fun TaskGroupCard(
                         )
                     }
                 } else {
-                    Spacer(Modifier.size(36.dp)) // Giữ bố cục nhất quán
+                    Spacer(Modifier.size(36.dp))
                 }
             }
 
@@ -462,7 +462,6 @@ private fun TaskGroupCard(
             }
         }
 
-        // Phần nội dung có thể thu gọn
         AnimatedVisibility(
             visible = taskGroup.isExpanded && totalCount > 0 && !isEditMode,
             enter = expandVertically(expandFrom = Alignment.Top, animationSpec = tween(300)) + fadeIn(animationSpec = tween(300)),
@@ -471,7 +470,6 @@ private fun TaskGroupCard(
             Column(
                 modifier = Modifier.padding(start = 36.dp, end = 36.dp, top = 4.dp, bottom = 8.dp)
             ) {
-                // Thanh tiến trình
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.padding(bottom = 8.dp)
@@ -483,7 +481,6 @@ private fun TaskGroupCard(
                         modifier = Modifier.padding(start = 8.dp)
                     )
                 }
-                // Danh sách nhiệm vụ con
                 taskGroup.subTasks.forEach { subTask ->
                     SubTaskDisplayItem(
                         subTask = subTask,
@@ -618,7 +615,7 @@ private fun TaskDetailsDialog(
 
     var newSubtaskText by remember { mutableStateOf("") }
     var showReminderSection by remember { mutableStateOf(existingTask?.dueDate != null) }
-    var selectedDateTime by remember { mutableStateOf(existingTask?.dueDate ?: LocalDateTime.now()) }
+    var selectedDateTime by remember { mutableStateOf(existingTask?.dueDate ?: LocalDateTime.now().plusMinutes(1)) }
 
     val isSaveEnabled = title.isNotBlank()
 
@@ -636,7 +633,70 @@ private fun TaskDetailsDialog(
         subtasks = mutableListOf()
         newSubtaskText = ""
         showReminderSection = false
-        selectedDateTime = LocalDateTime.now()
+        selectedDateTime = LocalDateTime.now().plusMinutes(1)
+    }
+
+    val context = LocalContext.current
+    var hasNotificationPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+        )
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { isGranted ->
+            hasNotificationPermission = isGranted
+            if (isGranted) showReminderSection = true
+        }
+    )
+
+    var showExactAlarmPermissionDialog by remember { mutableStateOf(false) }
+    val alarmManager = context.getSystemService(AlarmManager::class.java)
+
+    val settingsLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.StartActivityForResult()) {
+        // Sau khi người dùng quay lại từ cài đặt, ta có thể kiểm tra lại quyền và lưu task
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && alarmManager.canScheduleExactAlarms()) {
+            val finalDueDate = if (showReminderSection) selectedDateTime else null
+            val taskGroupId = existingTask?.id ?: UUID.randomUUID()
+            val finalSubtasks = subtasks.mapIndexed { index, subTask -> subTask.copy(order = index, taskGroupId = taskGroupId) }
+            val allCompleted = finalSubtasks.isNotEmpty() && finalSubtasks.all { it.isCompleted }
+            val taskToSave = TaskGroup(
+                id = taskGroupId, title = title, subTasks = finalSubtasks, dueDate = finalDueDate,
+                isExpanded = existingTask?.isExpanded ?: true, isCompleted = allCompleted, order = existingTask?.order ?: tasksCount
+            )
+            onSaveTask(taskToSave)
+            resetState()
+        }
+    }
+
+    if (showExactAlarmPermissionDialog) {
+        AlertDialog(
+            onDismissRequest = { showExactAlarmPermissionDialog = false },
+            title = { Text("Yêu cầu quyền", fontWeight = FontWeight.Bold) },
+            text = { Text("Để đảm bảo bạn không bỏ lỡ nhiệm vụ, ứng dụng cần quyền \"Báo thức và lời nhắc\" để gửi thông báo đúng giờ.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showExactAlarmPermissionDialog = false
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+                            data = Uri.fromParts("package", context.packageName, null)
+                            settingsLauncher.launch(this)
+                        }
+                    }
+                }) {
+                    Text("Đến cài đặt")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExactAlarmPermissionDialog = false }) {
+                    Text("Hủy")
+                }
+            }
+        )
     }
 
     Box(
@@ -664,7 +724,6 @@ private fun TaskDetailsDialog(
             )
             Spacer(modifier = Modifier.height(20.dp))
 
-            // --- Tên nhiệm vụ ---
             BasicTextField(
                 value = title,
                 onValueChange = { title = it },
@@ -682,11 +741,9 @@ private fun TaskDetailsDialog(
             )
             Spacer(modifier = Modifier.height(16.dp))
 
-            // --- Nhiệm vụ con ---
             Text("Nhiệm vụ con", style = MaterialTheme.typography.titleSmall.copy(fontSize = 16.sp, fontWeight = FontWeight.SemiBold))
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Danh sách subtask có thể sắp xếp
             LazyColumn(
                 state = subtaskReorderState.listState,
                 modifier = Modifier
@@ -694,34 +751,20 @@ private fun TaskDetailsDialog(
                     .heightIn(max = 200.dp)
             ) {
                 itemsIndexed(subtasks, key = { _, item -> item.id }) { index, subtask ->
-                    ReorderableItem(reorderableState = subtaskReorderState, key = subtask.id) { isDragging ->
+                    ReorderableItem(reorderableState = subtaskReorderState, key = subtask.id) {
                         val focusRequester = remember { FocusRequester() }
                         SubTaskItem(
                             modifier = Modifier.detectReorderAfterLongPress(subtaskReorderState),
                             subTask = subtask,
-                            onCheckedChange = {
-                                subtasks = subtasks.toMutableList().apply {
-                                    set(index, subtask.copy(isCompleted = !subtask.isCompleted))
-                                }
-                            },
-                            onValueChange = { newText ->
-                                subtasks = subtasks.toMutableList().apply {
-                                    set(index, subtask.copy(title = newText))
-                                }
-                            },
-                            onRemove = {
-                                subtasks = subtasks.toMutableList().apply {
-                                    removeAt(index)
-                                }
-                            },
+                            onCheckedChange = { subtasks = subtasks.toMutableList().apply { set(index, subtask.copy(isCompleted = !subtask.isCompleted)) } },
+                            onValueChange = { newText -> subtasks = subtasks.toMutableList().apply { set(index, subtask.copy(title = newText)) } },
+                            onRemove = { subtasks = subtasks.toMutableList().apply { removeAt(index) } },
                             focusRequester = focusRequester,
                         )
                     }
                 }
             }
 
-
-            // --- Thêm nhiệm vụ con mới ---
             Row(modifier = Modifier.padding(top = 8.dp)) {
                 BasicTextField(
                     value = newSubtaskText,
@@ -736,16 +779,10 @@ private fun TaskDetailsDialog(
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = {
                         if (newSubtaskText.isNotBlank()) {
-                            val newSub = SubTask(
-                                id = UUID.randomUUID(),
-                                taskGroupId = existingTask?.id ?: UUID.randomUUID(), // Tạm thời, sẽ được ghi đè khi lưu
-                                title = newSubtaskText,
-                                isCompleted = false,
-                                order = subtasks.size
-                            )
+                            val newSub = SubTask(id = UUID.randomUUID(), taskGroupId = existingTask?.id ?: UUID.randomUUID(), title = newSubtaskText, isCompleted = false, order = subtasks.size)
                             subtasks = (subtasks + newSub) as MutableList<SubTask>
                             newSubtaskText = ""
-                            newSubtaskFocus.requestFocus() // Focus lại vào textfield
+                            newSubtaskFocus.requestFocus()
                         } else {
                             focusManager.clearFocus()
                         }
@@ -761,13 +798,7 @@ private fun TaskDetailsDialog(
                     .background(Color.LightGray)
                     .clickable {
                         if (newSubtaskText.isNotBlank()) {
-                            val newSub = SubTask(
-                                id = UUID.randomUUID(),
-                                taskGroupId = existingTask?.id ?: UUID.randomUUID(),
-                                title = newSubtaskText,
-                                isCompleted = false,
-                                order = subtasks.size
-                            )
+                            val newSub = SubTask(id = UUID.randomUUID(), taskGroupId = existingTask?.id ?: UUID.randomUUID(), title = newSubtaskText, isCompleted = false, order = subtasks.size)
                             subtasks = (subtasks + newSub) as MutableList<SubTask>
                             newSubtaskText = ""
                             newSubtaskFocus.requestFocus()
@@ -780,14 +811,23 @@ private fun TaskDetailsDialog(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // --- Nhắc nhở ---
             AnimatedVisibility(visible = !showReminderSection) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .border(2.dp, Color.Gray.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { showReminderSection = true }
+                        .clickable {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                if (!hasNotificationPermission) {
+                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                } else {
+                                    showReminderSection = true
+                                }
+                            } else {
+                                showReminderSection = true
+                            }
+                        }
                         .padding(vertical = 12.dp),
                     contentAlignment = Alignment.Center
                 ) {
@@ -819,7 +859,6 @@ private fun TaskDetailsDialog(
             }
 
             Spacer(modifier = Modifier.height(24.dp))
-            // --- Nút Hủy và Lưu ---
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Box(modifier = Modifier
                     .weight(1f)
@@ -840,23 +879,35 @@ private fun TaskDetailsDialog(
                     .background(saveButtonColor)
                     .clickable(enabled = isSaveEnabled) {
                         val finalDueDate = if (showReminderSection) selectedDateTime else null
-                        val taskGroupId = existingTask?.id ?: UUID.randomUUID()
-                        val finalSubtasks = subtasks.mapIndexed { index, subTask ->
-                            subTask.copy(order = index, taskGroupId = taskGroupId)
+                        val proceedToSave = {
+                            val taskGroupId = existingTask?.id ?: UUID.randomUUID()
+                            val finalSubtasks = subtasks.mapIndexed { index, subTask -> subTask.copy(order = index, taskGroupId = taskGroupId) }
+                            val allCompleted = finalSubtasks.isNotEmpty() && finalSubtasks.all { it.isCompleted }
+                            val taskToSave = TaskGroup(
+                                id = taskGroupId, title = title, subTasks = finalSubtasks, dueDate = finalDueDate,
+                                isExpanded = existingTask?.isExpanded ?: true, isCompleted = allCompleted, order = existingTask?.order ?: tasksCount
+                            )
+                            onSaveTask(taskToSave)
+                            resetState()
                         }
-                        val allCompleted = finalSubtasks.isNotEmpty() && finalSubtasks.all { it.isCompleted }
 
-                        val taskToSave = TaskGroup(
-                            id = taskGroupId,
-                            title = title,
-                            subTasks = finalSubtasks,
-                            dueDate = finalDueDate,
-                            isExpanded = existingTask?.isExpanded ?: true,
-                            isCompleted = allCompleted,
-                            order = existingTask?.order ?: tasksCount
-                        )
-                        onSaveTask(taskToSave)
-                        resetState()
+                        if (finalDueDate != null) {
+                            if(finalDueDate.isAfter(LocalDateTime.now())){
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    if (alarmManager.canScheduleExactAlarms()) {
+                                        proceedToSave()
+                                    } else {
+                                        showExactAlarmPermissionDialog = true
+                                    }
+                                } else {
+                                    proceedToSave()
+                                }
+                            } else {
+                                proceedToSave()
+                            }
+                        } else {
+                            proceedToSave()
+                        }
                     }, contentAlignment = Alignment.Center) {
                     Text("Lưu", fontWeight = FontWeight.Bold, color = Color.White)
                 }
@@ -865,22 +916,19 @@ private fun TaskDetailsDialog(
     }
 }
 
-
 @RequiresApi(Build.VERSION_CODES.O)
 @Composable
 fun DateTimePicker(
     initialDateTime: LocalDateTime,
     onDateTimeSelected: (LocalDateTime) -> Unit
 ) {
-    val todayStart = LocalDate.now().atStartOfDay()
-
     WheelDateTimePicker(
         modifier = Modifier.fillMaxWidth(),
         startDateTime = initialDateTime,
-        minDateTime = LocalDateTime.now().minusYears(100),
+        minDateTime = LocalDateTime.now(),
         maxDateTime = LocalDateTime.now().plusYears(100),
-        timeFormat = TimeFormat.AM_PM,
-        size = DpSize(300.dp, 160.dp),
+        timeFormat = TimeFormat.HOUR_24,
+        size = DpSize(360.dp, 160.dp),
         rowCount = 5,
         textStyle = MaterialTheme.typography.bodyLarge,
         textColor = textSecondary,
@@ -891,12 +939,15 @@ fun DateTimePicker(
             border = null
         ),
         onSnappedDateTime = { snapped ->
-            if (!snapped.isBefore(todayStart)) {
+            if (snapped.isAfter(LocalDateTime.now())) {
                 onDateTimeSelected(snapped)
+            } else {
+                onDateTimeSelected(LocalDateTime.now().plusMinutes(1))
             }
         }
     )
 }
+
 
 @Composable
 private fun CustomProgressBar(progress: Float, isCompleted: Boolean, modifier: Modifier = Modifier) {
